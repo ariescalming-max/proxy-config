@@ -2,7 +2,7 @@
 const fs = require("fs");
 const path = require("path");
 
-const FILE = path.join(__dirname, "QuantumultX.conf");
+const FILE = path.join(__dirname, "QX.conf");
 const BUILTIN = ["direct", "proxy", "reject"];
 const POLICY_KINDS = ["static", "url-latency-benchmark", "available", "round-robin", "dest-hash", "ssid"];
 

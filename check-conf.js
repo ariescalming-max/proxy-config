@@ -2,7 +2,7 @@
 const fs = require("fs");
 const path = require("path");
 
-const FILE = path.join(__dirname, "Shadowrocket.conf");
+const FILE = path.join(__dirname, "SR.conf");
 const BUILTIN = ["DIRECT", "REJECT", "REJECT-DROP", "PROXY"];
 const RULE_FLAGS = ["no-resolve", "force-remote-dns", "pre-matching", "extended-matching"];
 const TYPES = ["select", "url-test", "fallback", "load-balance", "random", "ssid"];

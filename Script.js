@@ -7,11 +7,16 @@
  *  1) 一份脚本适配多机场: 地区分组按订阅里"真实存在的节点"动态生成,
  *     没有对应节点的地区不会留下空分组 (mihomo 遇到空分组会直接报错)
  *  2) 机场自带的分组/规则整体替换; 但 merge/覆写链里注入的 DIRECT/REJECT
- *     规则会被自动保留 (你的 CF/WeGame/Trae 直连规则不会丢)
+ *     规则会被自动保留 (你的 CF/WeGame/Trae 直连规则不会丢)。保留的规则插在
+ *     "广告过滤之后、应用分流之前", 不是插在最前面 —— 否则机场自带的
+ *     GEOIP,CN,DIRECT 之类会抢在广告规则前面, 把国内托管的广告全部放行
  *  3) 规则集统一用 MetaCubeX .mrs 二进制格式, 体积小、加载快, 走 jsDelivr CDN
  *  4) 分组名沿用旧脚本命名, store-selected 里已保存的选择不会失效
  *  5) 机场公告节点(剩余流量/到期时间)不参与任何自动分组和测速
- *  6) 出现意外时返回原配置而不是 throw, 不会把订阅变成不可用状态
+ *  6) 出现意外时返回原配置而不是 throw: 全程在深拷贝的副本上修改, 中途抛错
+ *     返回的是一点没动过的原对象, 不会留下改了一半的配置
+ *  7) 有 proxy-providers 时不做分组裁剪 —— 订阅里有哪些节点要运行时才知道,
+ *     静态判断会把 provider 里明明存在的地区组误删
  * ============================================================================
  */
 
@@ -28,7 +33,13 @@ const OPT = {
   // 本地网络/运营商可见, 代理账号密码也是明文传输。所以不让它们参与"按延迟
   // 自动挑选"的分组; 仍可在 ⚙️ 节点选择 等分组里手动选中。留空字符串=不排除
   excludePlaintextTypes: "http|socks5",
-  plaintextInHome: true,    // 「🏠 家宽原生」是否仍保留明文家宽节点(解锁用)
+  // 「🏠 家宽原生」是否也把明文家宽节点收进来。默认 false ——
+  // 这个组是 AI 分组的候选之一, 手动切过去之后 ChatGPT / Claude 的流量就会走它,
+  // 而明文链路上你访问的域名和代理账号密码对本地网络/运营商都是可见的。
+  // 你的家宽节点确实是明文、并且愿意用它换解锁成功率, 再改回 true。
+  // 注意 exclude-type 是按协议类型排除, 分不出"明文 http"和"套了 TLS 的 http",
+  // mihomo 没有更细的开关, 所以带 TLS 的 http/socks5 也会被一起排掉。
+  plaintextInHome: false,
   cdn: "https://testingcf.jsdelivr.net",
   fallback: "🔰 模式选择",  // 规则目标不存在时回退到这个分组
   testUrl: "https://www.gstatic.com/generate_204",
@@ -50,9 +61,12 @@ const LANDING_NODES = [
 // 注意: 下面的正则同时交给 mihomo(Go RE2) 使用, 不能用 (?=) (?!) (?<=) 等断言
 // 机场的信息/公告节点: 不进任何自动分组
 // 注意别写太宽的词(比如单独的"流量"), 否则「XX流量站-线路1」这种真节点会被误杀
+// 同理不能写单独的"禁止": 机场常把节点标成「日本01 禁止BT」「香港 禁止UDP」,
+// 那是真节点的属性标签, 不是公告条目。只匹配公告里才会出现的完整说法。
 const INFO_PATTERN =
   "剩余|到期|过期|重置|官网|客服|通知|失联|发布页|网址|导航|订阅|续费|试用|" +
-  "邀请|加群|群组|禁止|expire|reset|renew|website|sponsor|invite";
+  "邀请|加群|群组|禁止滥用|禁止批量|禁止发布|禁止违规|禁止转售|" +
+  "expire|reset|renew|website|sponsor|invite";
 
 // 家宽/原生 IP: ChatGPT、Claude、流媒体解锁成功率最高的一类节点
 const RESIDENTIAL_PATTERN =
@@ -98,7 +112,8 @@ const REGIONS = [
   },
   {
     name: "🇪🇺 欧洲", icon: "EU",
-    pattern: "🇩🇪|🇬🇧|🇳🇱|🇫🇷|🇷🇺|🇸🇪|🇨🇭|🇮🇹|🇪🇸|🇵🇱|🇫🇮|🇹🇷|" +
+    pattern: "🇩🇪|🇬🇧|🇳🇱|🇫🇷|🇷🇺|🇸🇪|🇨🇭|🇮🇹|🇪🇸|🇵🇱|🇫🇮|🇹🇷|🇪🇺|" +
+             "欧洲|歐洲|Europe|\\bEU[0-9]*\\b|" +
              "德国|德國|英国|英國|法国|法國|荷兰|荷蘭|瑞士|瑞典|意大利|西班牙|" +
              "波兰|芬兰|挪威|丹麦|爱尔兰|奥地利|比利时|捷克|土耳其|俄罗斯|乌克兰|" +
              "伦敦|法兰克福|阿姆斯特丹|巴黎|\\bDE[0-9]*\\b|\\bGER\\b|\\bUK[0-9]*\\b|" +
@@ -210,18 +225,58 @@ function geoip(key, file) {
     path: "./ruleset/mihomo/ip-" + key + ".mrs",
   });
 }
+// ACL4SSR 的 .mrs(域名表)。MetaCubeX 的 category-ads-all 实测只有 891 条,
+// 而 iOS 那份 QX 用的 AdvertisingLite 有 37692 条 —— 桌面这边的广告表太薄, 用这个补。
+function acl(key, file) {
+  return Object.assign({}, RP_BASE, {
+    behavior: "domain", format: "mrs",
+    url: OPT.cdn + "/gh/ACL4SSR/ACL4SSR@master/Clash/mrs/" + file + ".mrs",
+    path: "./ruleset/mihomo/acl-" + key + ".mrs",
+  });
+}
+// Aethersailor 的定向修正表: 专门收"会被 geosite:cn / geoip cn 误判"的域名和网段
+function aether(key, file, ip) {
+  return Object.assign({}, RP_BASE, {
+    behavior: ip ? "ipcidr" : "domain", format: "mrs",
+    url: OPT.cdn + "/gh/Aethersailor/Custom_OpenClash_Rules@main/rule/" + file + ".mrs",
+    path: "./ruleset/mihomo/ae-" + key + ".mrs",
+  });
+}
 
 const RULE_PROVIDERS = {
   // 基础
   private: geosite("private"),
   "private-ip": geoip("private-ip", "private"),
   ads: geosite("ads", "category-ads-all"),
+  // 广告补充(ACL4SSR)。只留 BanProgramAD —— 原因是浏览器里装了 uBlock Origin:
+  //   · BanEasyList(40977 条 / 520KB)拦的是浏览器网页广告, uBlock 已经在做, 而且
+  //     uBlock 能做元素隐藏, 代理层只能拦请求、页面上会留白块, 属于更差的重复
+  //   · BanEasyListChina(5050 条 / 59KB)同理, uBlock 的中文区域列表基本覆盖
+  //   · BanProgramAD 拦的是"客户端内广告"(网易云 PC / 迅雷 / WPS / Windows 推广位),
+  //     浏览器扩展管不到, 这层才是代理层在桌面独有的价值
+  // 哪天改成开 TUN 模式、或者不用浏览器扩展了, 把下面两行的注释去掉即可。
+  "ad-program": acl("ad-program", "BanProgramAD_domain"),      // 1016 条, App 内广告
+  // "ad-cn": acl("ad-cn", "BanEasyListChina_domain"),         // 5050 条, 国内网页广告
+  // "ad-easylist": acl("ad-easylist", "BanEasyList_domain"),  // 40977 条, 国际网页广告
+  // "ad-privacy": acl("ad-privacy", "BanEasyPrivacy_domain"), // 39852 条, 纯追踪
+  // 定向修正(Aethersailor)
+  "fix-proxy": aether("fix-proxy", "Custom_Proxy_Domain"),        // 17 条
+  "fix-proxy-ip": aether("fix-proxy-ip", "Custom_Proxy_IP", 1),   // 1 条
+  // Steam_CDN 那两个表没单独收 —— 2026-08-25 核对上游: Steam_CDN_Domain 的 3 条
+  // (cm.steampowered.com / steamcdn-a.akamaihd.net / steamserver.net)全在
+  // Game_Download_CDN_Domain 里(它自己带 421 条 steam 相关域名), Steam_CDN_IP 与
+  // Game_Download_CDN_IP 内容完全相同(各 23 条), 四条规则又都指向直连, 属于纯重复。
+  "cdn-game": aether("cdn-game", "Game_Download_CDN_Domain"),     // 494 条
+  "cdn-game-ip": aether("cdn-game-ip", "Game_Download_CDN_IP", 1),// 23 条
   // AI
   openai: geosite("openai"),
   anthropic: geosite("anthropic"),
   gemini: geosite("gemini", "google-gemini"),
   xai: geosite("xai"),
   perplexity: geosite("perplexity"),
+  // GitHub Copilot 有自己的 geosite 文件; 上游没有 copilot / microsoft-copilot,
+  // 网页版的 copilot.microsoft.com 落在 geosite:microsoft 里, 所以下面单独写域名规则
+  copilot: geosite("copilot", "github-copilot"),
   // 应用
   telegram: geosite("telegram"),
   "telegram-ip": geoip("telegram-ip", "telegram"),
@@ -280,6 +335,10 @@ const G = {
 
 /* ------------------------------ 7. 规则 ---------------------------------- */
 // 走直连的进程: 腾讯游戏/反作弊(挂代理会踢号)、Steam 客户端、本地 IDE
+// 注意副作用: 这里写进程名等于该进程全部流量直连, 后面的 RULE-SET 对它不再生效。
+//   steam.exe / steamwebhelper.exe → 后面的 RULE-SET,steam 只对浏览器等其他进程有效
+//   Trae.exe → 后面 githubusercontent.com 走代理的规则对 Trae 不生效(它是国内版, 本就走直连)
+// 这两条都是故意的; 哪天 Steam 商店页打不开或 Trae 装不上插件, 先从这里摘对应进程。
 const DIRECT_PROCESS = [
   "crossfire.exe", "crossfire_x64.exe", "launchcrossfire.exe", "GameLoader.exe",
   "ACE-Helper.exe", "ACE-Service64.exe", "SGuard64.exe", "SGuardSvc64.exe",
@@ -296,14 +355,42 @@ const DIRECT_DOMAIN = [
 const PROXY_DOMAIN = [
   "immersivetranslate.com", "githubusercontent.com", "cursor.sh",
 ];
+// 必须抢在 DIRECT_DOMAIN 前面拦掉的腾讯广告域名(见 buildRules 第 0 步)
+const AD_HOST_FIRST = [
+  "pgdt.gtimg.com", "pgdt.gtimg.cn", "adsmind.gdtimg.com", "adsmind.tc.qq.com",
+];
 // 走日本节点的域名 (go.jp=省厅/入管, ac.jp=大学, or.jp=JEES/NHK 等法人)
 const JAPAN_DOMAIN = [
   "go.jp", "ac.jp", "or.jp", "ne.jp", "lg.jp",
   "jlpt.jp", "jpss.jp", "weblio.jp", "nicovideo.jp", "yahoo.co.jp",
 ];
 
-function buildRules() {
+// 网页版 Copilot 的域名: geosite:github-copilot 只收 GitHub 那套(api.githubcopilot.com 等),
+// copilot.microsoft.com / copilot.cloud.microsoft 落在 geosite:microsoft 里, 会被微软组抢走
+const COPILOT_DOMAIN = [
+  "copilot.microsoft.com", "copilot.cloud.microsoft", "copilot.cloud.microsoft.com",
+];
+
+function buildRules(keptRules) {
   const R = [];
+  const all = Array.isArray(keptRules) ? keptRules : [];
+  // 链里保留下来的规则分两拨:
+  //   · kept   = 具体规则(某个域名/进程/网段的直连或拦截) —— 插在下面 3.5 段
+  //   · keptCn = 宽泛的"国内一律直连"(GEOIP,CN / GEOSITE,cn / RULE-SET,China*)
+  //              —— 挪到第 7 段。放在前面的话它会抢在 fix-proxy 之前:
+  //              googleapis.cn / gstatic.com 这些"挂在 .cn 或解析出国内 IP"的域名
+  //              会被判成直连, 结果是连不上。另外不带 no-resolve 的 GEOIP,CN 会让
+  //              每个还没命中的域名都先解析一次再往下走, 应用分流全都白等一轮 DNS。
+  const kept = [];
+  const keptCn = [];
+  for (let i = 0; i < all.length; i++) {
+    if (isBroadDomestic(all[i])) keptCn.push(all[i]); else kept.push(all[i]);
+  }
+  // 0) 被下面 DIRECT_DOMAIN 的宽后缀(gtimg.com / gtimg.cn / tencent.com)盖住的
+  // 腾讯广告域名。必须写在自定义直连前面 —— 否则整条 gtimg.com 直连会把它们一起放行,
+  // 而 iOS 那份 QX 配置里这几个是 REJECT 的, 两端行为要一致。
+  for (let i = 0; i < AD_HOST_FIRST.length; i++)
+    R.push("DOMAIN-SUFFIX," + AD_HOST_FIRST[i] + "," + G.ads);
   // 1) 自定义: 放最前面, 优先级最高
   for (let i = 0; i < DIRECT_PROCESS.length; i++)
     R.push("PROCESS-NAME," + DIRECT_PROCESS[i] + "," + G.myDirect);
@@ -319,6 +406,16 @@ function buildRules() {
 
   // 3) 广告
   R.push("RULE-SET,ads," + G.ads);
+  R.push("RULE-SET,ad-program," + G.ads);
+  // R.push("RULE-SET,ad-cn," + G.ads);        // 见 RULE_PROVIDERS 处的说明
+  // R.push("RULE-SET,ad-easylist," + G.ads);
+  // R.push("RULE-SET,ad-privacy," + G.ads);
+
+  // 3.5) 链里已有的直连/拦截规则插在这里 —— 不是插在最前面。
+  // 放最前面的话, 机场自带的宽泛 DIRECT 会抢在广告过滤前面, 结果是托管在国内的
+  // 广告域名全部直连放行。放在广告之后、应用分流之前最稳。
+  // 注意这里只有"具体规则"; 宽泛的国内直连(GEOIP,CN 之类)在第 7 段。
+  for (let i = 0; i < kept.length; i++) R.push(kept[i]);
 
   // 4) AI (放在 google/microsoft 前面, 否则 gemini/copilot 会被抢走)
   R.push("RULE-SET,anthropic," + G.claude);
@@ -326,6 +423,19 @@ function buildRules() {
   R.push("RULE-SET,gemini," + G.ai);
   R.push("RULE-SET,xai," + G.ai);
   R.push("RULE-SET,perplexity," + G.ai);
+  R.push("RULE-SET,copilot," + G.ai);
+  for (let i = 0; i < COPILOT_DOMAIN.length; i++)
+    R.push("DOMAIN-SUFFIX," + COPILOT_DOMAIN[i] + "," + G.ai);
+
+  // 4.5) 游戏下载 CDN 走直连: 必须排在下面 steam/games 规则前面, 这样即使你把
+  // 「🎮 游戏平台」切成代理, 下载流量也照旧直连 —— 几十 GB 的更新不该过代理。
+  // 注意 steam.exe / steamwebhelper.exe 仍然留在 DIRECT_PROCESS 里没动:
+  // 客户端内嵌浏览器的图片域名不一定都在 geosite:steam 里, 摘掉进程规则会让它们
+  // 掉到「漏网之鱼」走代理, 反而更慢。这两条 CDN 规则真正受益的是 Epic / 暴雪 /
+  // PSN / Xbox 这些没有进程规则的启动器, 以及浏览器里直接下的安装包。
+  // (Steam 的 CDN 域名/网段已经含在 cdn-game 里, 见 RULE_PROVIDERS 处的核对记录)
+  R.push("RULE-SET,cdn-game," + G.direct);
+  R.push("RULE-SET,cdn-game-ip," + G.direct + ",no-resolve");
 
   // 5) 应用分流
   R.push("RULE-SET,telegram," + G.telegram);
@@ -350,7 +460,17 @@ function buildRules() {
   for (let i = 0; i < JAPAN_DOMAIN.length; i++)
     R.push("DOMAIN-SUFFIX," + JAPAN_DOMAIN[i] + "," + G.japan);
 
+  // 6.5) 会被误判成国内的国外域名: 必须排在下面「国内直连」前面。
+  // 这些域名解析出来是国内 IP(或本身挂在国内 CDN 上), geosite:cn / geoip cn
+  // 会把它们当国内流量直连, 结果就是连不上。只有 17 + 2 条, 320 字节。
+  // 里面是 googleapis.cn / gstatic.com / mtalk.google.com / onedrive.live.com /
+  // ip.sb / ipify.org(查 IP 的站被直连会告诉你错的出口)/ hoyolab / dmhy 之类。
+  R.push("RULE-SET,fix-proxy," + G.mode);
+  R.push("RULE-SET,fix-proxy-ip," + G.mode + ",no-resolve");
+
   // 7) 国内直连
+  // 机场/覆写链里那些宽泛的"国内一律直连"规则归到这里, 排在上面的修正规则之后
+  for (let i = 0; i < keptCn.length; i++) R.push(keptCn[i]);
   R.push("RULE-SET,bilibili," + G.direct);
   R.push("RULE-SET,cn," + G.direct);
   R.push("RULE-SET,cn-ip," + G.direct + ",no-resolve");
@@ -393,7 +513,9 @@ function autoGrp(o) {
 const ALL_REGION_NAMES = REGIONS.map(function (r) { return r.name; })
   .concat([OTHER_REGION.name]);
 
-function buildGroups() {
+// landingNames: 已经去重/避开保留名的落地节点名(见 validLandingNodes)
+function buildGroups(landingNames) {
+  const landing = Array.isArray(landingNames) ? landingNames : [];
   const AUTO = [G.urltest, G.fallback, G.lbHash, G.lbRR];
   // 手动挑选类候选: 分组 + 地区 + 落地
   const PICKS = [G.pick, G.home].concat(ALL_REGION_NAMES, AUTO, [G.landing]);
@@ -432,8 +554,8 @@ function buildGroups() {
   // —— 家宽/原生 IP ——
   // 用 fallback 而不是 url-test: 只要当前节点还活着就一直用它, IP 稳定,
   // AI 站点不容易要求重新登录; 节点挂了才自动切到下一个可用的
-  // 这个组默认保留明文 http 家宽节点(它们往往是解锁效果最好的一批),
-  // 想连这里也只用加密节点, 把 OPT.plaintextInHome 改成 false
+  // 这个组默认排除明文 http/socks5 节点(它是 AI 分组的候选之一, 明文链路上域名和
+  // 代理账号密码对本地网络可见)。想把明文家宽也收进来, 把 OPT.plaintextInHome 改成 true
   if (OPT.residentialGroup) {
     groups.push((OPT.plaintextInHome ? grp : autoGrp)({
       name: G.home, type: "fallback",
@@ -443,10 +565,10 @@ function buildGroups() {
   }
 
   // —— 落地节点 ——
-  if (LANDING_NODES.length) {
+  if (landing.length) {
     groups.push(grp({
       name: G.landing, type: "select",
-      proxies: LANDING_NODES.map(function (p) { return p.name; }),
+      proxies: landing.slice(),
       icon: vicon("openwrt"),
     }));
   }
@@ -470,8 +592,12 @@ function buildGroups() {
     }));
   }
 
-  // —— AI: 优先家宽原生, 排除港澳/大陆/俄伊 ——
-  const AI_PICKS = [G.home, "🇯🇵 日本", "🇺🇸 美国", "🇸🇬 新加坡", "🇹🇼 台湾",
+  // —— AI: 排除港澳/大陆/俄伊 ——
+  // 第一个候选就是 select 组的默认值。这里放「🇯🇵 日本」而不是「🏠 家宽原生」:
+  //   1) 家宽组靠正则匹配, 免费机场大多没有家宽节点, 默认指向一个空组会直接连不上
+  //   2) 家宽节点常见是明文 http/socks5, 不该在你没主动选的情况下承载 AI 流量
+  // 家宽放第二位 —— 你订阅里真有加密家宽节点就手动切过去, AI 站点对住宅 IP 更友好。
+  const AI_PICKS = ["🇯🇵 日本", G.home, "🇺🇸 美国", "🇸🇬 新加坡", "🇹🇼 台湾",
                     "🇪🇺 欧洲", G.mode, G.pick, G.urltest, G.direct];
   groups.push(grp({
     name: G.claude, type: "select", proxies: AI_PICKS.slice(),
@@ -597,6 +723,30 @@ const UDP_TYPES = ["ss", "ssr", "vmess", "vless", "trojan", "snell", "socks5",
   "hysteria", "hysteria2", "tuic", "wireguard", "anytls", "mieru"];
 const RULE_PARAMS = ["no-resolve", "src"];
 
+// mihomo 里不能被节点占用的名字: 内置策略 + 脚本会建出来的所有分组名。
+// 节点叫 DIRECT, 或者机场把节点命名成「🔰 模式选择」这种, mihomo 会直接拒绝
+// 整份配置(proxy xxx is the duplicate name), 后果是一点网都没有。
+const RESERVED_NAMES = BUILTIN.concat(
+  Object.keys(G).map(function (k) { return G[k]; }),
+  ALL_REGION_NAMES
+);
+
+// 宽泛的"国内一律直连"规则: 只认 GEOIP,CN 和名字明显是国内表的 GEOSITE/RULE-SET
+// (cn / cn-ip / ChinaDomain / ChinaCompanyIp / geolocation-cn / 国内 / 直连 ...)。
+// 这类规则一旦排在 fix-proxy 前面就会误判国外域名, 所以要挪到国内直连那一段去。
+const DOMESTIC_SET = /^(cn|china|geolocation-cn|domestic|国内|直连)/i;
+function isBroadDomestic(rule) {
+  const parts = String(rule).split(",");
+  if (parts.length < 3) return false;
+  const type = parts[0].trim().toUpperCase();
+  const target = parts[targetIndex(parts)].trim().toUpperCase();
+  if (target !== "DIRECT" && target !== "PASS") return false;
+  const val = parts[1].trim();
+  if (type === "GEOIP") return val.toUpperCase() === "CN";
+  if (type === "GEOSITE" || type === "RULE-SET") return DOMESTIC_SET.test(val);
+  return false;
+}
+
 function say(msg) {
   try { console.log("[global-script] " + msg); } catch (e) { /* ignore */ }
 }
@@ -611,24 +761,32 @@ function targetIndex(parts) {
   return i;
 }
 
+// 给节点挑一个没被占用的名字: 撞了就加 " #2"、" #3" ... 直到全局不重复
+function uniqueName(name, taken) {
+  if (!has(taken, name)) return name;
+  let n = 2;
+  while (has(taken, name + " #" + n)) n++;
+  return name + " #" + n;
+}
+
 // 节点规范化: 丢弃残缺节点、处理重名、按协议开 UDP
-function normalizeProxies(list) {
+// 重名不只是"节点之间撞车": 撞上内置策略名或脚本自己的分组名同样致命, mihomo 会
+// 拒绝整份配置。所以先把保留名(内置 + 分组 + 落地节点)占位, 再逐个找到没被用过的
+// 新名字 —— 只加一次 " #2" 是不够的, 订阅里本来就可能已经有一个叫 "JP #2" 的节点。
+function normalizeProxies(list, reserved) {
   const out = [];
-  const seen = {};
+  const taken = {};
+  const pre = RESERVED_NAMES.concat(Array.isArray(reserved) ? reserved : []);
+  for (let i = 0; i < pre.length; i++) taken[pre[i]] = 1;
   for (let i = 0; i < list.length; i++) {
     const p = list[i];
     if (!p || typeof p !== "object" || typeof p.name !== "string" || !p.name) {
       say("跳过一个无名/残缺节点");
       continue;
     }
-    let name = p.name;
-    if (has(seen, name)) {
-      seen[name] += 1;
-      const nn = name + " #" + seen[name];
-      say("重名节点改名: " + name + " -> " + nn);
-      name = nn;
-    }
-    seen[name] = 1;
+    const name = uniqueName(p.name, taken);
+    if (name !== p.name) say("重名/占用保留名的节点改名: " + p.name + " -> " + name);
+    taken[name] = 1;
     p.name = name;
     if (OPT.udpForAll && UDP_TYPES.indexOf(String(p.type || "").toLowerCase()) !== -1) {
       p.udp = true;
@@ -638,16 +796,25 @@ function normalizeProxies(list) {
   return out;
 }
 
-// 落地节点校验: server/port 没填的直接忽略, 免得整份配置报错
+// 落地节点校验: server/port 没填的直接忽略, 免得整份配置报错。
+// 名字也要过一遍 —— 这几个是手写的, 写成 DIRECT 或者跟「🕊️ 落地节点」同名, mihomo
+// 一样拒收整份配置。改的是副本, 不动 LANDING_NODES 本身(否则重复执行会越改越长)。
 function validLandingNodes() {
   const out = [];
+  const taken = {};
+  for (let i = 0; i < RESERVED_NAMES.length; i++) taken[RESERVED_NAMES[i]] = 1;
   for (let i = 0; i < LANDING_NODES.length; i++) {
     const p = LANDING_NODES[i];
-    if (!p || !p.name || !p.server || !p.port) {
-      if (p && p.name) say("落地节点 " + p.name + " 缺 server/port, 已忽略");
+    const name = p && typeof p.name === "string" ? p.name.trim() : "";
+    if (!p || !name || !p.server || !p.port) {
+      if (name) say("落地节点 " + name + " 缺 server/port, 已忽略");
       continue;
     }
-    out.push(p);
+    const q = Object.assign({}, p);
+    q.name = uniqueName(name, taken);
+    if (q.name !== name) say("落地节点重名/占用保留名, 改名: " + name + " -> " + q.name);
+    taken[q.name] = 1;
+    out.push(q);
   }
   return out;
 }
@@ -699,14 +866,25 @@ function pruneGroups(groups, proxyNames, usable, unknown) {
   return live;
 }
 
+// 域名类规则的值应该是纯主机名。手写的覆写规则里常见 DOMAIN,http://x.com/ 这种,
+// mihomo 不报错但这条规则永远命中不了 —— 削掉协议头和路径, 削不干净就丢掉。
+const DOMAIN_TYPES = ["DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD"];
+const BAD_HOST = /[\s?#@]/;
+function cleanDomain(v) {
+  let s = String(v).trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
+  const slash = s.indexOf("/");
+  if (slash !== -1) s = s.slice(0, slash);
+  return s.replace(/\.+$/, "").toLowerCase();
+}
+
 // 挑出链里已注入的、目标是 DIRECT/REJECT 的规则 (merge 或规则覆写写进来的)
 function keepUserRules(orig, providers, mine) {
   const keep = [];
   if (!Array.isArray(orig)) return keep;
   for (let i = 0; i < orig.length; i++) {
-    const r = orig[i];
-    if (typeof r !== "string" || !r.trim()) continue;
-    const parts = r.split(",");
+    const raw = orig[i];
+    if (typeof raw !== "string" || !raw.trim()) continue;
+    const parts = raw.split(",");
     if (parts.length < 3) continue;                       // MATCH,xxx 之类跳过
     const type = parts[0].trim().toUpperCase();
     if (type === "MATCH" || type === "FINAL" || type === "SUB-RULE") continue;
@@ -714,6 +892,18 @@ function keepUserRules(orig, providers, mine) {
     const t = parts[targetIndex(parts)].trim().toUpperCase();
     if (KEEPABLE.indexOf(t) === -1) continue;             // 只保留直连/拦截
     if (type === "RULE-SET" && !has(providers, parts[1].trim())) continue;
+    if (DOMAIN_TYPES.indexOf(type) !== -1) {
+      const host = cleanDomain(parts[1]);
+      if (!host || BAD_HOST.test(host)) {
+        say("域名写得不对, 丢掉这条规则: " + raw);
+        continue;
+      }
+      if (host !== parts[1].trim()) {
+        say("规则里的域名带了协议/路径, 已修正: " + parts[1].trim() + " -> " + host);
+        parts[1] = host;
+      }
+    }
+    const r = parts.join(",");
     if (mine.indexOf(r) !== -1 || keep.indexOf(r) !== -1) continue;
     keep.push(r);
   }
@@ -762,8 +952,11 @@ function enhance(config, profileName) {
   }
 
   /* --- 节点 --- */
+  // 落地节点的名字优先: 订阅里如果有同名节点, 改的是订阅那个
+  // (「🕊️ 落地节点」分组是按 landingNames 建的, 两边必须是同一份名字)
   const landing = validLandingNodes();
-  config.proxies = normalizeProxies(rawProxies).concat(landing);
+  const landingNames = landing.map(function (p) { return p.name; });
+  config.proxies = normalizeProxies(rawProxies, landingNames).concat(landing);
   const proxyNames = config.proxies.map(function (p) { return p.name; });
   const infoRe = re(INFO_PATTERN);
   const usable = [];   // 参与自动分组的节点: {name, type}
@@ -776,12 +969,17 @@ function enhance(config, profileName) {
     say(tag + "只识别到公告节点, 保持原配置不动");
     return config;
   }
-  const unknown = providerKeys.length > 0 && usable.length === 0;
+  // 有 proxy-providers 时, 订阅里到底有哪些节点要等运行时才知道, 静态判断不了。
+  // 这里只要存在 provider 就整体放行 —— 不能再要求"本地一个节点都没有"。
+  // 之前写的是 providerKeys.length > 0 && usable.length === 0, 后果是:
+  // 配置里同时有 1 个本地节点 + 订阅 provider 时, unknown=false, 于是按本地节点统计,
+  // 除了本地节点所属的那个地区, 其余地区分组全被当成空组删掉。
+  const unknown = providerKeys.length > 0;
 
   /* --- 分组 --- */
-  let groups = buildGroups();
-  const landingRe = landing.length
-    ? "^(?:" + landing.map(function (p) { return escapeRe(p.name); }).join("|") + ")$"
+  let groups = buildGroups(landingNames);
+  const landingRe = landingNames.length
+    ? "^(?:" + landingNames.map(escapeRe).join("|") + ")$"
     : "";
   for (let i = 0; i < groups.length; i++) {
     const g = groups[i];
@@ -802,10 +1000,16 @@ function enhance(config, profileName) {
   /* --- 规则 --- */
   const groupNames = groups.map(function (g) { return g.name; });
   const valid = groupNames.concat(BUILTIN, proxyNames);
-  const mine = buildRules();
-  const kept = OPT.keepUserRules ? keepUserRules(config.rules, providers, mine) : [];
-  if (kept.length) say(tag + "保留了 " + kept.length + " 条已有的直连/拦截规则");
-  const rules = fixRules(kept.concat(mine), valid, providers);
+  const mine0 = buildRules([]);           // 先建一份不含 kept 的, 只用来去重
+  const kept = OPT.keepUserRules ? keepUserRules(config.rules, providers, mine0) : [];
+  if (kept.length) {
+    let nCn = 0;
+    for (let i = 0; i < kept.length; i++) if (isBroadDomestic(kept[i])) nCn++;
+    say(tag + "保留了 " + kept.length + " 条已有的直连/拦截规则" +
+        (nCn ? " (其中 " + nCn + " 条宽泛国内直连已下移到国外域名修正之后)" : ""));
+  }
+  // kept 交给 buildRules 插到"广告之后、应用分流之前", 不再简单地拼在最前面
+  const rules = fixRules(buildRules(kept), valid, providers);
 
   /* --- 写回 --- */
   config["proxy-groups"] = groups;
@@ -830,11 +1034,22 @@ function enhance(config, profileName) {
 
 function main(config, profileName) {
   if (!config || typeof config !== "object") return config;
+  // 在副本上改, 不碰调用方传进来的对象。
+  // 以前是直接原地改 config, 一旦中途抛错, catch 里返回的其实是"改了一半"的配置
+  // (proxies/proxy-groups/rules 已经写进去了), 名义上回退, 实际上是半损坏状态。
+  let work;
   try {
-    return enhance(config, profileName);
+    work = JSON.parse(JSON.stringify(config));
+  } catch (e) {
+    // 配置里有循环引用或不可序列化的值 —— 与其原地改出个半成品, 不如原样放行
+    say("配置无法安全复制, 保持原样不动: " + e);
+    return config;
+  }
+  try {
+    return enhance(work, profileName);
   } catch (e) {
     say("脚本执行出错, 已回退原始配置: " + e);
-    return config;
+    return config;   // 原对象从头到尾没被碰过
   }
 }
 
